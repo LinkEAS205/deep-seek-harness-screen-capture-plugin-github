@@ -1,0 +1,9 @@
+# dsh-client-screen-snap bundle patch.
+#
+# Applied after the profile's existing bundle layers (dsh-base, dsh-web-app).
+# Inserts one plugin row; the browser half ships through the package's
+# `dsh.client` declaration (client.js) and is discovered by the client-modules
+# node half, which composes it into window.__DSH_BOOT__.
+- insert:
+    - id: dsh-client-screen-snap
+      name: dsh-client-screen-snap

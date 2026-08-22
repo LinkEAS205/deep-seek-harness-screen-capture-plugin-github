@@ -1,0 +1,14 @@
+{
+  "name": "dsh-client-screen-snap",
+  "description": "Real-time screen region capture & recognize for the DeepSeek Harness Web UI.",
+  "version": "1.0.0",
+  "entry": {
+    "name": "dsh-client-screen-snap",
+    "inject": [
+      "webServer"
+    ]
+  },
+  "client": {
+    "platform": "web"
+  }
+}
