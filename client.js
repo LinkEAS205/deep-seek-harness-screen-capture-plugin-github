@@ -7,7 +7,7 @@ window.__ModuleLoader__.load({
 
     const React = require('react')
     const RECOGNIZE_PATH = '/api/dsh-screen-snap/recognize'
-    const GRAB_PATH = '/api/dsh-screen-snap/grab'
+    const SELECT_PATH = '/api/dsh-screen-snap/select'
     const INJECT = ['slots']
 
     async function recognize(dataUrl, prompt, sessionId) {
@@ -21,11 +21,11 @@ window.__ModuleLoader__.load({
       return body
     }
 
-    // QQ 式截屏：由本地 Host 直接抓取整屏（PowerShell），无浏览器共享选择框
-    async function grabScreen() {
-      const response = await fetch(GRAB_PATH, { method: 'POST' })
+    // QQ 式截屏：Host 弹原生全屏窗口直接在屏幕上框选；返回 { ok, dataUrl?, cancelled? }
+    async function selectRegion() {
+      const response = await fetch(SELECT_PATH, { method: 'POST' })
       const body = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }))
-      if (!response.ok || !body.ok) throw new Error(body.error || `HTTP ${response.status}`)
+      if (!response.ok && !body.cancelled) throw new Error(body.error || `HTTP ${response.status}`)
       return body
     }
 
@@ -37,7 +37,6 @@ window.__ModuleLoader__.load({
         open: false,
         status: 'idle',
         previewUrl: '',
-        frozenUrl: '',
         prompt: '',
         error: '',
         sessionId: undefined,
@@ -57,29 +56,29 @@ window.__ModuleLoader__.load({
             onClick: () => {
               store.prompt = ''
               store.previewUrl = ''
-              store.frozenUrl = ''
               store.error = ''
               store.sessionId = sessionId
               store.open = true
-              store.status = 'grabbing'
+              store.status = 'selecting'
               notify()
             },
             title: '截取屏幕并识别（QQ 式框选）',
           },
             React.createElement('svg', {
-              width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', style: { marginRight: 5, flexShrink: 0 },
+              width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', style: { display: 'block', flexShrink: 0 },
             },
-              React.createElement('rect', { x: 3, y: 7, width: 18, height: 13, rx: 2 }),
-              React.createElement('circle', { cx: 12, cy: 13.5, r: 3.2 }),
-              React.createElement('polygon', { points: '9 7 11 4 13 4 15 7' }),
-            ),
-            '截图识别')
+              React.createElement('circle', { cx: 6, cy: 6, r: 3 }),
+              React.createElement('path', { d: 'M8.12 8.12 12 12' }),
+              React.createElement('path', { d: 'M20 4 8.12 15.88' }),
+              React.createElement('circle', { cx: 6, cy: 18, r: 3 }),
+              React.createElement('path', { d: 'M14.8 14.8 20 20' }),
+            ))
         },
       ))
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register(
         { name: 'shell.overlay', id: 'screen-snap-overlay', order: 90, label: '截图识别' },
-        () => React.createElement(CaptureView, { store, subscribe, recognize, grabScreen }),
+        () => React.createElement(CaptureView, { store, subscribe, recognize, selectRegion }),
       ))
 
       // 注入玻璃拟态样式：直接用 DOM（与 frosted-glass 相同方式，避免 styles 服务不可用）
@@ -94,7 +93,7 @@ window.__ModuleLoader__.load({
     }
 
     const CSS = [
-      '.scap-trigger{display:inline-flex;align-items:center;justify-content:center;padding:4px 11px;border-radius:999px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.18);backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px);color:rgba(255,255,255,0.92);font-size:13px;cursor:pointer;user-select:none;line-height:1;transition:background .15s ease,border-color .15s ease}',
+      '.scap-trigger{display:inline-flex;align-items:center;justify-content:center;padding:5px;border-radius:999px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.18);backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px);color:rgba(255,255,255,0.92);font-size:13px;cursor:pointer;user-select:none;line-height:1;transition:background .15s ease,border-color .15s ease}',
       '.scap-trigger:hover{background:rgba(255,255,255,0.17);border-color:rgba(255,255,255,0.32)}',
       '.scap-overlay{position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(18,18,24,0.5);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);user-select:none;-webkit-user-select:none}',
       '.scap-toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;color:#fff;padding:10px 14px;border-radius:14px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.16);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,0.18)}',
@@ -116,14 +115,13 @@ window.__ModuleLoader__.load({
     ].join('')
 
     function CaptureView(props) {
-      const { store, subscribe, recognize, grabScreen } = props
+      const { store, subscribe, recognize, selectRegion } = props
       const [, force] = React.useState(0)
       React.useEffect(() => subscribe(() => force((n) => n + 1)), [])
 
       const boxRef = React.useRef(null)
       const videoRef = React.useRef(null)
       const mediaRef = React.useRef(null)
-      const imgRef = React.useRef(null)
       const [stream, setStream] = React.useState(null)
       const [boxSize, setBoxSize] = React.useState(null)
       const [sel, setSel] = React.useState({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
@@ -152,29 +150,40 @@ window.__ModuleLoader__.load({
         return () => v.removeEventListener('loadedmetadata', onMeta)
       }, [stream])
 
-      // QQ 式截屏：点按钮即本地抓整屏，冻结为可框选画面；Host 不可用时回退浏览器共享
+      // QQ 式截屏：请求 Host 弹原生全屏框选窗口；取消则收起浮层；
+      // Host 不可用（非 Windows / 旧版 Host）时回退浏览器共享模式。
       React.useEffect(() => {
-        if (store.status !== 'grabbing') return
+        if (store.status !== 'selecting') return
         let cancelled = false
-        grabScreen().then((r) => {
+        selectRegion().then((body) => {
           if (cancelled) return
-          store.frozenUrl = r.dataUrl
-          store.status = 'freeze'
-          setSel({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
-          setBoxSize(null)
-          notify_()
+          if (body && body.ok && body.dataUrl) {
+            store.previewUrl = body.dataUrl
+            store.status = 'confirm'
+            notify_()
+            return
+          }
+          if (body && body.cancelled) {
+            store.open = false
+            store.status = 'idle'
+            store.previewUrl = ''
+            notify_()
+            return
+          }
+          throw new Error(body && body.error ? body.error : '未知错误')
         }).catch((e) => {
           if (cancelled) return
-          startCapture('本地整屏截取不可用（' + String(e && e.message ? e.message : e) + '），已回退浏览器共享模式')
+          startCapture('本地截屏不可用（' + String(e && e.message ? e.message : e) + '），已回退浏览器共享模式')
         })
         return () => { cancelled = true }
       }, [store.status])
 
-      // Esc 取消（在提示词输入框里按 Esc 不关闭）
+      // Esc 取消（原生框选时 Esc 由原生窗口接管；输入框内不触发）
       React.useEffect(() => {
         if (!store.open) return
         const onKey = (e) => {
           if (e.key !== 'Escape') return
+          if (store.status === 'selecting') return
           const tag = e.target && e.target.tagName
           if (tag === 'INPUT' || tag === 'TEXTAREA') return
           close()
@@ -190,7 +199,6 @@ window.__ModuleLoader__.load({
         mediaRef.current = null
         store.open = false
         store.status = 'idle'
-        store.frozenUrl = ''
         setStream(null)
         setBoxSize(null)
         setSel({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
@@ -199,6 +207,7 @@ window.__ModuleLoader__.load({
         notify_()
       }
 
+      // 回退路径：浏览器共享屏幕，实时画面框选
       const startCapture = async (fallbackNote) => {
         try {
           const s = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false })
@@ -216,17 +225,8 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const onImgLoad = () => {
-        const img = imgRef.current
-        if (!img || !img.naturalWidth || !img.naturalHeight) return
-        const availW = window.innerWidth * 0.98
-        const availH = window.innerHeight * 0.9
-        const scale = Math.min(availW / img.naturalWidth, availH / img.naturalHeight)
-        setBoxSize({ w: Math.round(img.naturalWidth * scale), h: Math.round(img.naturalHeight * scale) })
-      }
-
       const onDown = (e) => {
-        if (store.status !== 'capturing' && store.status !== 'freeze') return
+        if (store.status !== 'capturing') return
         if (!boxSize) return
         const r = boxRef.current.getBoundingClientRect()
         try { e.currentTarget.setPointerCapture(e.pointerId) } catch (_) {}
@@ -240,37 +240,9 @@ window.__ModuleLoader__.load({
       const onUp = (e) => {
         if (!sel.active) return
         const r = boxRef.current.getBoundingClientRect()
-        // 终点直接取松手事件的坐标，避免最后一次 pointermove 未渲染导致框选滞后
         const end = { sx: sel.sx, sy: sel.sy, ex: e.clientX - r.left, ey: e.clientY - r.top }
         setSel((c) => ({ ...c, active: false, ex: end.ex, ey: end.ey }))
-        if (store.status === 'freeze') cropFromImage(end)
-        else crop(end)
-      }
-
-      // QQ 式：从冻结的整屏图裁剪（stage 与图片显示区完全重合，无偏移）
-      const cropFromImage = (c) => {
-        const img = imgRef.current
-        if (!img || !img.naturalWidth) { store.status = 'error'; store.error = '尚未获取到屏幕画面'; notify_(); return }
-        if (!boxSize) { store.status = 'error'; store.error = '画面尺寸尚未就绪'; notify_(); return }
-
-        const scale = boxSize.w / img.naturalWidth
-        const dispX1 = Math.max(0, Math.min(c.sx, c.ex))
-        const dispY1 = Math.max(0, Math.min(c.sy, c.ey))
-        const dispX2 = Math.min(boxSize.w, Math.max(c.sx, c.ex))
-        const dispY2 = Math.min(boxSize.h, Math.max(c.sy, c.ey))
-        const x = dispX1 / scale
-        const y = dispY1 / scale
-        const w = (dispX2 - dispX1) / scale
-        const h = (dispY2 - dispY1) / scale
-        if (w < 2 || h < 2) { store.status = 'error'; store.error = '框选区域过小'; notify_(); return }
-
-        const out = document.createElement('canvas')
-        out.width = Math.max(1, Math.round(w))
-        out.height = Math.max(1, Math.round(h))
-        out.getContext('2d').drawImage(img, x, y, w, h, 0, 0, out.width, out.height)
-        store.previewUrl = out.toDataURL('image/png')
-        store.status = 'confirm'
-        notify_()
+        crop(end)
       }
 
       // 回退路径：从浏览器共享视频流裁剪
@@ -326,21 +298,12 @@ window.__ModuleLoader__.load({
         notify_()
       }
 
-      const reselect = () => {
-        // 已有冻结整屏图时回到冻结态重新框选，不必重新抓屏
-        store.status = store.frozenUrl ? 'freeze' : 'idle'
+      const startSelect = () => {
+        if (store.status === 'selecting' || store.status === 'capturing' || store.status === 'uploading') return
+        store.status = 'selecting'
         store.previewUrl = ''
         store.error = ''
-        setBoxSize(null)
-        setSel({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
-        notify_()
-      }
-
-      const startNew = () => {
-        if (store.status === 'grabbing') return
-        store.status = 'grabbing'
-        store.previewUrl = ''
-        store.error = ''
+        setStream(null)
         setBoxSize(null)
         setSel({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
         notify_()
@@ -351,30 +314,28 @@ window.__ModuleLoader__.load({
         notify_()
       }
 
-      const dragging = store.status === 'capturing' || store.status === 'freeze'
+      const dragging = store.status === 'capturing'
       const selW = Math.abs(sel.ex - sel.sx)
       const selH = Math.abs(sel.ey - sel.sy)
       const selX = Math.min(sel.sx, sel.ex)
       const selY = Math.min(sel.sy, sel.ey)
-      const busy = store.status === 'grabbing' || store.status === 'capturing' || store.status === 'uploading'
-      const showPrompt = store.status === 'idle' || store.status === 'capturing' || store.status === 'freeze' || store.status === 'confirm'
+      const busy = store.status === 'selecting' || store.status === 'capturing' || store.status === 'uploading'
+      const showPrompt = store.status === 'confirm'
       const stageCls = 'scap-stage' + (dragging ? ' capturing' : '')
       const inResult = store.status === 'confirm' || store.status === 'uploading' || store.status === 'done' || store.status === 'error'
-      const startLabel = store.status === 'grabbing' ? '正在截屏…'
+      const startLabel = store.status === 'selecting' ? '等待框选…'
         : store.status === 'capturing' ? '正在共享…'
-          : store.status === 'freeze' ? '重新截屏' : '立即截屏'
+          : '重新截屏'
 
       return React.createElement('div', { className: 'scap-overlay' },
         React.createElement('div', { className: 'scap-toolbar' },
           React.createElement('span', null,
-            store.status === 'idle' ? '点「立即截屏」冻结当前屏幕，然后拖拽框选'
-              : store.status === 'grabbing' ? '正在截取屏幕…'
-                : store.status === 'freeze' ? '已冻结屏幕：拖拽框选识别区域（Esc 取消）'
-                  : store.status === 'capturing' ? '已共享：请拖拽框选识别区域'
-                    : store.status === 'confirm' ? '已裁剪：请在下方预览确认后发送'
-                      : store.status === 'uploading' ? '上传识别中…' : ''),
-          React.createElement('button', { className: 'scap-btn', onClick: startNew, disabled: busy }, startLabel),
-          React.createElement('button', { className: 'scap-btn', onClick: close }, '取消'),
+            store.status === 'selecting' ? '请在弹出的全屏画面上拖拽框选（Esc / 右键取消）'
+              : store.status === 'capturing' ? (store.error || '已共享：请拖拽框选识别区域')
+                : store.status === 'confirm' ? '已框选：预览确认后发送'
+                  : store.status === 'uploading' ? '上传识别中…' : ''),
+          React.createElement('button', { className: 'scap-btn', onClick: startSelect, disabled: busy }, startLabel),
+          React.createElement('button', { className: 'scap-btn', onClick: close, disabled: store.status === 'selecting' }, '取消'),
         ),
 
         React.createElement('div', {
@@ -385,13 +346,6 @@ window.__ModuleLoader__.load({
           onPointerUp: onUp,
           style: boxSize ? { width: boxSize.w, height: boxSize.h } : { width: '90vw', maxWidth: 1200, height: '72vh' },
         },
-          store.status === 'freeze' && store.frozenUrl
-            ? React.createElement('img', {
-              ref: imgRef, src: store.frozenUrl, onLoad: onImgLoad, draggable: false,
-              style: { position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'fill', pointerEvents: 'none', userSelect: 'none' },
-            })
-            : null,
-
           store.status === 'capturing'
             ? React.createElement('video', {
               ref: videoRef, muted: true, autoPlay: true, playsInline: true,
@@ -419,7 +373,7 @@ window.__ModuleLoader__.load({
               store.status === 'confirm'
                 ? React.createElement('div', { className: 'row' },
                   React.createElement('button', { className: 'scap-btn primary', onClick: confirmSend }, '✅ 确认发送'),
-                  React.createElement('button', { className: 'scap-btn', onClick: reselect }, '↺ 重新框选'),
+                  React.createElement('button', { className: 'scap-btn', onClick: startSelect }, '↺ 重新框选'),
                 )
                 : null,
               store.status === 'uploading' ? React.createElement('div', { className: 'status' }, '上传并识别中…') : null,
@@ -434,10 +388,10 @@ window.__ModuleLoader__.load({
             : null,
 
           store.status === 'idle'
-            ? React.createElement('div', { style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.5)' } }, '点「立即截屏」后将冻结屏幕并进入框选')
+            ? React.createElement('div', { style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.5)' } }, '点「重新截屏」后直接在屏幕上框选')
             : null,
-          store.status === 'grabbing'
-            ? React.createElement('div', { style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.6)' } }, '正在截取屏幕…')
+          store.status === 'selecting'
+            ? React.createElement('div', { style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.6)' } }, '已弹出全屏截屏窗口…')
             : null,
         ),
 

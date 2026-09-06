@@ -1,7 +1,7 @@
 {
   "name": "dsh-client-screen-snap",
-  "version": "1.1.0",
-  "description": "QQ-style screen capture & recognize for the DeepSeek Harness Web UI: grab the whole desktop locally, drag-select a frozen frame, preview, then inject it into the conversation so the multimodal model can recognize it and continue.",
+  "version": "1.2.0",
+  "description": "QQ-style screen capture & recognize for the DeepSeek Harness Web UI: a native fullscreen overlay (PowerShell/WinForms) covers the whole desktop 1:1 for drag-selection, then the crop goes to the conversation for multimodal recognition.",
   "license": "MIT",
   "keywords": [
     "deepseek-harness",
