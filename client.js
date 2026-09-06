@@ -65,7 +65,7 @@ window.__ModuleLoader__.load({
             title: '截取屏幕并识别（QQ 式框选）',
           },
             React.createElement('svg', {
-              width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', style: { display: 'block', flexShrink: 0 },
+              width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', transform: 'rotate(-90 12 12)', style: { display: 'block', flexShrink: 0 },
             },
               React.createElement('circle', { cx: 6, cy: 6, r: 3 }),
               React.createElement('path', { d: 'M8.12 8.12 12 12' }),
