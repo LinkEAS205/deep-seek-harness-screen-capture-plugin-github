@@ -7,6 +7,7 @@ window.__ModuleLoader__.load({
 
     const React = require('react')
     const RECOGNIZE_PATH = '/api/dsh-screen-snap/recognize'
+    const GRAB_PATH = '/api/dsh-screen-snap/grab'
     const INJECT = ['slots']
 
     async function recognize(dataUrl, prompt, sessionId) {
@@ -20,6 +21,14 @@ window.__ModuleLoader__.load({
       return body
     }
 
+    // QQ 式截屏：由本地 Host 直接抓取整屏（PowerShell），无浏览器共享选择框
+    async function grabScreen() {
+      const response = await fetch(GRAB_PATH, { method: 'POST' })
+      const body = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }))
+      if (!response.ok || !body.ok) throw new Error(body.error || `HTTP ${response.status}`)
+      return body
+    }
+
     function apply(ctx) {
       const slots = ctx.get('slots')
       if (slots === undefined) return
@@ -28,6 +37,7 @@ window.__ModuleLoader__.load({
         open: false,
         status: 'idle',
         previewUrl: '',
+        frozenUrl: '',
         prompt: '',
         error: '',
         sessionId: undefined,
@@ -47,13 +57,14 @@ window.__ModuleLoader__.load({
             onClick: () => {
               store.prompt = ''
               store.previewUrl = ''
+              store.frozenUrl = ''
               store.error = ''
               store.sessionId = sessionId
               store.open = true
-              store.status = 'idle'
+              store.status = 'grabbing'
               notify()
             },
-            title: '实时框选截图并识别',
+            title: '截取屏幕并识别（QQ 式框选）',
           },
             React.createElement('svg', {
               width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', style: { marginRight: 5, flexShrink: 0 },
@@ -68,7 +79,7 @@ window.__ModuleLoader__.load({
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register(
         { name: 'shell.overlay', id: 'screen-snap-overlay', order: 90, label: '截图识别' },
-        () => React.createElement(CaptureView, { store, subscribe, recognize }),
+        () => React.createElement(CaptureView, { store, subscribe, recognize, grabScreen }),
       ))
 
       // 注入玻璃拟态样式：直接用 DOM（与 frosted-glass 相同方式，避免 styles 服务不可用）
@@ -105,17 +116,19 @@ window.__ModuleLoader__.load({
     ].join('')
 
     function CaptureView(props) {
-      const { store, subscribe, recognize } = props
+      const { store, subscribe, recognize, grabScreen } = props
       const [, force] = React.useState(0)
       React.useEffect(() => subscribe(() => force((n) => n + 1)), [])
 
       const boxRef = React.useRef(null)
       const videoRef = React.useRef(null)
       const mediaRef = React.useRef(null)
+      const imgRef = React.useRef(null)
       const [stream, setStream] = React.useState(null)
       const [boxSize, setBoxSize] = React.useState(null)
       const [sel, setSel] = React.useState({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
-      const timer = props.timer
+
+      const notify_ = () => force((n) => n + 1)
 
       React.useEffect(() => {
         const v = videoRef.current
@@ -139,14 +152,45 @@ window.__ModuleLoader__.load({
         return () => v.removeEventListener('loadedmetadata', onMeta)
       }, [stream])
 
-      if (!store.open) return null
+      // QQ 式截屏：点按钮即本地抓整屏，冻结为可框选画面；Host 不可用时回退浏览器共享
+      React.useEffect(() => {
+        if (store.status !== 'grabbing') return
+        let cancelled = false
+        grabScreen().then((r) => {
+          if (cancelled) return
+          store.frozenUrl = r.dataUrl
+          store.status = 'freeze'
+          setSel({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
+          setBoxSize(null)
+          notify_()
+        }).catch((e) => {
+          if (cancelled) return
+          startCapture('本地整屏截取不可用（' + String(e && e.message ? e.message : e) + '），已回退浏览器共享模式')
+        })
+        return () => { cancelled = true }
+      }, [store.status])
 
-      const notify_ = () => force((n) => n + 1)
+      // Esc 取消（在提示词输入框里按 Esc 不关闭）
+      React.useEffect(() => {
+        if (!store.open) return
+        const onKey = (e) => {
+          if (e.key !== 'Escape') return
+          const tag = e.target && e.target.tagName
+          if (tag === 'INPUT' || tag === 'TEXTAREA') return
+          close()
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [store.open])
+
+      if (!store.open) return null
 
       const close = () => {
         if (mediaRef.current) mediaRef.current.getTracks().forEach((t) => t.stop())
+        mediaRef.current = null
         store.open = false
         store.status = 'idle'
+        store.frozenUrl = ''
         setStream(null)
         setBoxSize(null)
         setSel({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
@@ -155,25 +199,37 @@ window.__ModuleLoader__.load({
         notify_()
       }
 
-      const startCapture = async () => {
+      const startCapture = async (fallbackNote) => {
         try {
           const s = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false })
           mediaRef.current = s
           setStream(s)
           store.status = 'capturing'
+          store.error = fallbackNote || ''
           setSel({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
           notify_()
         } catch (e) {
           store.status = 'error'
-          store.error = '无法截屏：' + String(e && e.message ? e.message : e)
+          store.error = (fallbackNote ? fallbackNote + '；浏览器共享也被拒绝：' : '无法截屏：')
+            + String(e && e.message ? e.message : e)
           notify_()
         }
       }
 
+      const onImgLoad = () => {
+        const img = imgRef.current
+        if (!img || !img.naturalWidth || !img.naturalHeight) return
+        const availW = window.innerWidth * 0.98
+        const availH = window.innerHeight * 0.9
+        const scale = Math.min(availW / img.naturalWidth, availH / img.naturalHeight)
+        setBoxSize({ w: Math.round(img.naturalWidth * scale), h: Math.round(img.naturalHeight * scale) })
+      }
+
       const onDown = (e) => {
-        if (store.status !== 'capturing') return
+        if (store.status !== 'capturing' && store.status !== 'freeze') return
         if (!boxSize) return
         const r = boxRef.current.getBoundingClientRect()
+        try { e.currentTarget.setPointerCapture(e.pointerId) } catch (_) {}
         setSel({ active: true, sx: e.clientX - r.left, sy: e.clientY - r.top, ex: e.clientX - r.left, ey: e.clientY - r.top })
       }
       const onMove = (e) => {
@@ -181,12 +237,43 @@ window.__ModuleLoader__.load({
         const r = boxRef.current.getBoundingClientRect()
         setSel((c) => ({ ...c, ex: e.clientX - r.left, ey: e.clientY - r.top }))
       }
-      const onUp = () => {
+      const onUp = (e) => {
         if (!sel.active) return
-        setSel((c) => ({ ...c, active: false }))
-        crop(sel)
+        const r = boxRef.current.getBoundingClientRect()
+        // 终点直接取松手事件的坐标，避免最后一次 pointermove 未渲染导致框选滞后
+        const end = { sx: sel.sx, sy: sel.sy, ex: e.clientX - r.left, ey: e.clientY - r.top }
+        setSel((c) => ({ ...c, active: false, ex: end.ex, ey: end.ey }))
+        if (store.status === 'freeze') cropFromImage(end)
+        else crop(end)
       }
 
+      // QQ 式：从冻结的整屏图裁剪（stage 与图片显示区完全重合，无偏移）
+      const cropFromImage = (c) => {
+        const img = imgRef.current
+        if (!img || !img.naturalWidth) { store.status = 'error'; store.error = '尚未获取到屏幕画面'; notify_(); return }
+        if (!boxSize) { store.status = 'error'; store.error = '画面尺寸尚未就绪'; notify_(); return }
+
+        const scale = boxSize.w / img.naturalWidth
+        const dispX1 = Math.max(0, Math.min(c.sx, c.ex))
+        const dispY1 = Math.max(0, Math.min(c.sy, c.ey))
+        const dispX2 = Math.min(boxSize.w, Math.max(c.sx, c.ex))
+        const dispY2 = Math.min(boxSize.h, Math.max(c.sy, c.ey))
+        const x = dispX1 / scale
+        const y = dispY1 / scale
+        const w = (dispX2 - dispX1) / scale
+        const h = (dispY2 - dispY1) / scale
+        if (w < 2 || h < 2) { store.status = 'error'; store.error = '框选区域过小'; notify_(); return }
+
+        const out = document.createElement('canvas')
+        out.width = Math.max(1, Math.round(w))
+        out.height = Math.max(1, Math.round(h))
+        out.getContext('2d').drawImage(img, x, y, w, h, 0, 0, out.width, out.height)
+        store.previewUrl = out.toDataURL('image/png')
+        store.status = 'confirm'
+        notify_()
+      }
+
+      // 回退路径：从浏览器共享视频流裁剪
       const crop = (c) => {
         const v = videoRef.current
         if (!v || !v.videoWidth) { store.status = 'error'; store.error = '尚未获取到画面帧'; notify_(); return }
@@ -240,7 +327,8 @@ window.__ModuleLoader__.load({
       }
 
       const reselect = () => {
-        store.status = 'idle'
+        // 已有冻结整屏图时回到冻结态重新框选，不必重新抓屏
+        store.status = store.frozenUrl ? 'freeze' : 'idle'
         store.previewUrl = ''
         store.error = ''
         setBoxSize(null)
@@ -248,26 +336,44 @@ window.__ModuleLoader__.load({
         notify_()
       }
 
-      const promptChange = (e) => { store.prompt = e.target.value }
+      const startNew = () => {
+        if (store.status === 'grabbing') return
+        store.status = 'grabbing'
+        store.previewUrl = ''
+        store.error = ''
+        setBoxSize(null)
+        setSel({ active: false, sx: 0, sy: 0, ex: 0, ey: 0 })
+        notify_()
+      }
 
+      const promptChange = (e) => {
+        store.prompt = e.target.value
+        notify_()
+      }
+
+      const dragging = store.status === 'capturing' || store.status === 'freeze'
       const selW = Math.abs(sel.ex - sel.sx)
       const selH = Math.abs(sel.ey - sel.sy)
       const selX = Math.min(sel.sx, sel.ex)
       const selY = Math.min(sel.sy, sel.ey)
-      const busy = store.status === 'capturing' || store.status === 'uploading'
-      const showPrompt = store.status === 'idle' || store.status === 'capturing' || store.status === 'confirm'
-      const stageCls = 'scap-stage' + (store.status === 'capturing' ? ' capturing' : '')
+      const busy = store.status === 'grabbing' || store.status === 'capturing' || store.status === 'uploading'
+      const showPrompt = store.status === 'idle' || store.status === 'capturing' || store.status === 'freeze' || store.status === 'confirm'
+      const stageCls = 'scap-stage' + (dragging ? ' capturing' : '')
       const inResult = store.status === 'confirm' || store.status === 'uploading' || store.status === 'done' || store.status === 'error'
+      const startLabel = store.status === 'grabbing' ? '正在截屏…'
+        : store.status === 'capturing' ? '正在共享…'
+          : store.status === 'freeze' ? '重新截屏' : '立即截屏'
 
       return React.createElement('div', { className: 'scap-overlay' },
         React.createElement('div', { className: 'scap-toolbar' },
           React.createElement('span', null,
-            store.status === 'idle' ? '点「开始截屏」，然后拖拽框选要识别的区域'
-              : store.status === 'capturing' ? '已共享：请拖拽框选识别区域'
-                : store.status === 'confirm' ? '已裁剪：请在下方预览确认后发送'
-                  : store.status === 'uploading' ? '上传识别中…' : ''),
-          React.createElement('button', { className: 'scap-btn', onClick: startCapture, disabled: busy },
-            store.status === 'capturing' ? '正在共享…' : '开始截屏'),
+            store.status === 'idle' ? '点「立即截屏」冻结当前屏幕，然后拖拽框选'
+              : store.status === 'grabbing' ? '正在截取屏幕…'
+                : store.status === 'freeze' ? '已冻结屏幕：拖拽框选识别区域（Esc 取消）'
+                  : store.status === 'capturing' ? '已共享：请拖拽框选识别区域'
+                    : store.status === 'confirm' ? '已裁剪：请在下方预览确认后发送'
+                      : store.status === 'uploading' ? '上传识别中…' : ''),
+          React.createElement('button', { className: 'scap-btn', onClick: startNew, disabled: busy }, startLabel),
           React.createElement('button', { className: 'scap-btn', onClick: close }, '取消'),
         ),
 
@@ -279,6 +385,13 @@ window.__ModuleLoader__.load({
           onPointerUp: onUp,
           style: boxSize ? { width: boxSize.w, height: boxSize.h } : { width: '90vw', maxWidth: 1200, height: '72vh' },
         },
+          store.status === 'freeze' && store.frozenUrl
+            ? React.createElement('img', {
+              ref: imgRef, src: store.frozenUrl, onLoad: onImgLoad, draggable: false,
+              style: { position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'fill', pointerEvents: 'none', userSelect: 'none' },
+            })
+            : null,
+
           store.status === 'capturing'
             ? React.createElement('video', {
               ref: videoRef, muted: true, autoPlay: true, playsInline: true,
@@ -286,7 +399,7 @@ window.__ModuleLoader__.load({
             })
             : null,
 
-          store.status === 'capturing' && selW > 1 && selH > 1
+          dragging && selW > 1 && selH > 1
             ? React.createElement('div', {
               style: {
                 position: 'absolute', left: selX, top: selY, width: selW, height: selH,
@@ -321,7 +434,10 @@ window.__ModuleLoader__.load({
             : null,
 
           store.status === 'idle'
-            ? React.createElement('div', { style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.5)' } }, '点「开始截屏」后将在画面上框选')
+            ? React.createElement('div', { style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.5)' } }, '点「立即截屏」后将冻结屏幕并进入框选')
+            : null,
+          store.status === 'grabbing'
+            ? React.createElement('div', { style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.6)' } }, '正在截取屏幕…')
             : null,
         ),
 
