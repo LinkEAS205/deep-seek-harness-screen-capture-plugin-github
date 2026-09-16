@@ -1,13 +1,11 @@
 export const name = 'dsh-client-screen-snap'
 export const inject = ['webServer']
 
-import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
-export const RECOGNIZE_PATH = '/api/dsh-screen-snap/recognize'
 export const SELECT_PATH = '/api/dsh-screen-snap/select'
 export const DIAG_PATH = '/api/dsh-screen-snap/diag'
 
@@ -37,31 +35,6 @@ function readLog(maxLines = 60) {
   } catch (error) {
     return ['<no log: ' + String(error && error.message ? error.message : error) + '>']
   }
-}
-
-// 读取 JSON 请求体（限制大小，防止超大截图）
-function readJsonBody(req, maxBytes = 20 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    let size = 0
-    const chunks = []
-    req.on('data', (chunk) => {
-      size += chunk.length
-      if (size > maxBytes) {
-        reject(new Error('payload too large'))
-        req.destroy()
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-      } catch (error) {
-        reject(error)
-      }
-    })
-    req.on('error', reject)
-  })
 }
 
 function reply(res, status, body) {
@@ -170,7 +143,7 @@ const SELECT_SCRIPT = [
   '    $ms0 = New-Object System.IO.MemoryStream',
   '    $script:shot.Save($ms0, [System.Drawing.Imaging.ImageFormat]::Png)',
   '    [Console]::Out.Write([Convert]::ToBase64String($ms0.ToArray()))',
-  '    [Console]::Error.Write(\'SCAP \' + (@{ ok = $true; ms = Elapsed; selftest = $true; width = $w; height = $h } | ConvertTo-Json -Compress))',
+  '    [Console]::Error.WriteLine(\'SCAP \' + (@{ ok = $true; ms = Elapsed; selftest = $true; width = $w; height = $h } | ConvertTo-Json -Compress))',
   '    exit 0',
   '  }',
   '',
@@ -301,12 +274,18 @@ const SELECT_SCRIPT = [
   '  $script:tRun = Elapsed',
   '  $script:timer.Stop()',
   '  $script:timer.Dispose()',
+  '  # 表单几何必须在 Dispose 之前采样：一旦释放，$script:form 就是 $null 了，',
+  '  # 后面 $meta.form 那段判断永远不成立（v1.3.0 的 form/formBounds 因此恒为 null）。',
+  '  if ($null -ne $script:form) {',
+  '    $script:formGeom = @($script:form.ClientSize.Width, $script:form.ClientSize.Height)',
+  '    $script:formBounds = @($script:form.Bounds.X, $script:form.Bounds.Y, $script:form.Bounds.Width, $script:form.Bounds.Height)',
+  '  }',
   '  $script:form.Dispose()',
   '  $script:form = $null',
   '} catch {',
   '  $script:reason = \'error\'',
   '  $script:err = $_.Exception.Message',
-  '  [Console]::Error.Write(\'SCAP \' + (@{ ok = $false; stage = \'setup\'; reason = $script:reason; error = $script:err; ms = (Elapsed) } | ConvertTo-Json -Compress))',
+  '  [Console]::Error.WriteLine(\'SCAP \' + (@{ ok = $false; stage = \'setup\'; reason = $script:reason; error = $script:err; ms = (Elapsed) } | ConvertTo-Json -Compress))',
   '  exit 1',
   '}',
   '',
@@ -314,9 +293,9 @@ const SELECT_SCRIPT = [
   '  # 几何体检：虚拟屏原点/尺寸、表单实际客户区尺寸、DPI 认知状态。',
   '  # 副屏是 1600x2560 竖向屏时，只要抓屏尺寸被 DPI 虚拟化成一半，遮罩就只会盖住上半屏。',
   '  $meta.virt = @($x, $y, $w, $h)',
-  '  if ($null -ne $script:form) {',
-  '    $meta.form = @($script:form.ClientSize.Width, $script:form.ClientSize.Height)',
-  '    $meta.formBounds = @($script:form.Bounds.X, $script:form.Bounds.Y, $script:form.Bounds.Width, $script:form.Bounds.Height)',
+  '  if ($null -ne $script:formGeom) {',
+  '    $meta.form = $script:formGeom',
+  '    $meta.formBounds = $script:formBounds',
   '  }',
   '  $meta.dpiAware = [bool][ScapNative]::IsProcessDPIAware()',
   '  $meta.dpiCtx = $script:dpiCtx',
@@ -329,7 +308,7 @@ const SELECT_SCRIPT = [
   'if ($script:cancelled -or $null -eq $script:selRect) {',
   '  if ($meta.reason -eq \'ok\') { $meta.reason = \'none\' }',
   '  $meta.ms = Elapsed',
-  '  [Console]::Error.Write(\'SCAP \' + ($meta | ConvertTo-Json -Compress))',
+  '  [Console]::Error.WriteLine(\'SCAP \' + ($meta | ConvertTo-Json -Compress))',
   '  if ($meta.reason -eq \'watchdog\') { exit 4 }',
   '  exit 3',
   '}',
@@ -350,10 +329,10 @@ const SELECT_SCRIPT = [
   '  $meta.selW = $r.Width',
   '  $meta.selH = $r.Height',
   '  $meta.ms = Elapsed',
-  '  [Console]::Error.Write(\'SCAP \' + ($meta | ConvertTo-Json -Compress))',
+  '  [Console]::Error.WriteLine(\'SCAP \' + ($meta | ConvertTo-Json -Compress))',
   '  exit 0',
   '} catch {',
-  '  [Console]::Error.Write(\'SCAP \' + (@{ ok = $false; stage = \'crop\'; reason = \'error\'; error = $_.Exception.Message; ms = (Elapsed) } | ConvertTo-Json -Compress))',
+  '  [Console]::Error.WriteLine(\'SCAP \' + (@{ ok = $false; stage = \'crop\'; reason = \'error\'; error = $_.Exception.Message; ms = (Elapsed) } | ConvertTo-Json -Compress))',
   '  exit 1',
   '}',
 ].join('\n')
@@ -404,15 +383,29 @@ function diagEnd(extra) {
 }
 
 // 从脚本 stderr 里挑出 SCAP 前缀那一行（其余是 CLIXML 噪声，必须忽略）。
+//
+// 这里踩过一个很隐蔽的坑：PowerShell 把 stderr 包成 CLIXML，开头一行 `#< CLIXML`，
+// 而脚本自己写的内容与结尾的 `<Objs …>` 之间【不一定有换行】——实测就是
+//   `#< CLIXML\r\nSCAP {json}<Objs Version="1.1.0.1" …></Objs>`
+// 于是只按 '\n' 截断会把 CLIXML 尾巴一起喂给 JSON.parse，永远抛异常、永远返回 null。
+// v1.3.0 的几何诊断与阶段耗时从上线起就没生效过，根因就在这几行。
+// 现在两种粘法都能切干净：换行和 '<Objs' 谁先出现用谁（脚本侧也已改用 WriteLine）。
 function parseScapMeta(text) {
   if (typeof text !== 'string') return null
   const idx = text.indexOf('SCAP ')
   if (idx < 0) return null
   let line = text.slice(idx + 5)
+  let end = line.length
   const nl = line.indexOf('\n')
-  if (nl >= 0) line = line.slice(0, nl)
+  if (nl >= 0 && nl < end) end = nl
+  const tail = line.indexOf('<Objs')
+  if (tail >= 0 && tail < end) end = tail
+  line = line.slice(0, end).trim()
+  if (line.length === 0) return null
   try {
-    return JSON.parse(line.trim())
+    const parsed = JSON.parse(line)
+    // 只有真正的对象才算解析成功，避免把 null / 标量当成有效元数据。
+    return (parsed !== null && typeof parsed === 'object') ? parsed : null
   } catch {
     return null
   }
@@ -598,120 +591,6 @@ export async function apply(ctx) {
     }
   }
 
-  const recognizeHandler = async (req, res) => {
-    if (req.method !== 'POST' && req.method !== 'OPTIONS') {
-      reply(res, 405, { ok: false, error: 'method not allowed' })
-      return
-    }
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'POST, OPTIONS',
-        'access-control-allow-headers': 'content-type',
-      })
-      res.end()
-      return
-    }
-    if (!sameOrigin(req)) {
-      reply(res, 403, { ok: false, error: '拒绝跨域调用' })
-      return
-    }
-    let replied = false
-    const send = (status, body) => {
-      if (replied) return
-      replied = true
-      if (res.destroyed || res.writableEnded) return
-      reply(res, status, body)
-    }
-    try {
-      const payload = await readJsonBody(req)
-      const dataUrl = payload && payload.dataUrl
-      const prompt = (payload && typeof payload.prompt === 'string' && payload.prompt.length > 0)
-        ? payload.prompt
-        : '请识别这张截图的内容。'
-      const sessionId = payload && payload.sessionId
-
-      if (typeof dataUrl !== 'string' || dataUrl.indexOf('data:image/') !== 0) {
-        send(400, { ok: false, error: '无效的图片数据' })
-        return
-      }
-      if (typeof sessionId !== 'string' || sessionId.length === 0) {
-        send(400, { ok: false, error: '缺少会话 id' })
-        return
-      }
-
-      const comma = dataUrl.indexOf(',')
-      const header = dataUrl.slice(0, comma)
-      const data = dataUrl.slice(comma + 1)
-      const m = /^data:([^;]+);base64$/.exec(header)
-      const mediaType = (m ? m[1] : 'image/png')
-      const content = [
-        { type: 'image', mediaType, data, name: 'screenshot.png' },
-        { type: 'text', text: prompt },
-      ]
-
-      // DSH >=0.1.5：sessionController.prompt(request, signal) 直调（本版本走这条）。
-      const sessionController = ctx.get('sessionController')
-      if (sessionController !== undefined && typeof sessionController.prompt === 'function') {
-        const controller = new AbortController()
-        const timer = setTimeout(() => {
-          try { controller.abort() } catch {}
-        }, 120000)
-        // 客户端中途放弃时同样中止，避免 DSH 侧留下悬挂的图片注入。
-        res.on('close', () => {
-          if (!res.writableEnded) {
-            try { controller.abort() } catch {}
-          }
-        })
-        try {
-          await sessionController.prompt({
-            requestId: 'screen-snap-' + randomUUID(),
-            sessionId,
-            mode: 'queue',
-            content,
-          }, controller.signal)
-        } finally {
-          clearTimeout(timer)
-        }
-        logLine({ kind: 'recognize', ok: true, bytes: data.length })
-        send(200, { ok: true })
-        return
-      }
-
-      const apiProxy = ctx.get('apiProxy')
-      if (apiProxy === undefined || apiProxy.sessions === undefined) {
-        send(500, { ok: false, error: '会话服务不可用（sessionController / apiProxy 均未挂载）' })
-        return
-      }
-
-      const response = await apiProxy.sessions.prompt({
-        rpcId: 'screen-snap-' + randomUUID(),
-        payload: {
-          sessionId,
-          mode: 'queue',
-          content,
-        },
-      })
-
-      if (response && response.result && response.result.ok) {
-        send(200, { ok: true })
-        return
-      }
-      const err = (response && response.result && !response.result.ok && response.result.error)
-        ? response.result.error
-        : { message: '消息发送失败' }
-      send(400, { ok: false, error: err.message || '消息发送失败' })
-    } catch (error) {
-      const message = String(error && error.message ? error.message : error)
-      logLine({ kind: 'recognize', ok: false, error: message })
-      const tooLarge = message.indexOf('payload too large') >= 0
-      send(tooLarge ? 413 : 500, {
-        ok: false,
-        error: tooLarge ? '截图体积过大（超过 20MB），请缩小框选范围' : message,
-      })
-    }
-  }
-
   // 诊断端点：GET /api/dsh-screen-snap/diag —— 当前状态 + 最近一次框选阶段耗时 + 日志尾部。
   const diagHandler = async (req, res) => {
     if (req.method !== 'GET') {
@@ -759,6 +638,5 @@ export async function apply(ctx) {
   }
 
   register(SELECT_PATH, selectHandler, 'dsh-client-screen-snap: select route')
-  register(RECOGNIZE_PATH, recognizeHandler, 'dsh-client-screen-snap: recognize route')
   register(DIAG_PATH, diagHandler, 'dsh-client-screen-snap: diag route')
 }

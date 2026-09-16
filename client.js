@@ -6,12 +6,58 @@ window.__ModuleLoader__.load({
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
     const React = require('react')
-    const RECOGNIZE_PATH = '/api/dsh-screen-snap/recognize'
     const SELECT_PATH = '/api/dsh-screen-snap/select'
     const INJECT = ['slots']
 
-    const RECOGNIZE_TIMEOUT_MS = 130000
     const SELECT_TIMEOUT_MS = 165000
+
+    /** 放进输入栏的那张图在 composer 附件栏里显示的文件名。 */
+    const DROP_FILE_NAME = 'screenshot.png'
+
+    /** 合成 drop 之后，等附件真正落进 composer 的上限（超时即判定没放进去）。 */
+    const PLACE_VERIFY_MS = 2000
+
+    /**
+     * 把 data URL 变成浏览器 File —— composer 的附件通路认的是 File / dataTransfer.files。
+     * 不走 fetch(dataURL) 是为了不依赖 data: URL 的 fetch 支持，手工解码更稳。
+     */
+    function dataUrlToFile(dataUrl, name) {
+      const comma = dataUrl.indexOf(',')
+      if (comma < 0) throw new Error('截图数据格式异常')
+      const header = dataUrl.slice(0, comma)
+      const body = dataUrl.slice(comma + 1)
+      const matched = /^data:([^;]+)/.exec(header)
+      const type = matched === null ? 'image/png' : matched[1]
+      const binary = atob(body)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+      return new File([bytes], name, { type: type })
+    }
+
+    /**
+     * 把一张图放进 composer 的输入栏（不发送，交给用户自己配文字再发）。
+     *
+     * 为什么是「合成一次 drop」而不是直接调 API：DSH 公开的 InputActions 里，
+     * 文字能用 setDraft() 写进去，但附件只有 addAttachments(ids)，而那种
+     * DraftAttachmentId 由 ConversationController.createDrafts() 铸造，只在
+     * package-private 的 ComposerBarInjected.addFiles 上露头，第三方插件够不着。
+     * 而附件栏（ui-attachment 的 ComposerAttachments）在 document 上挂了 drop 监听，
+     * 读 dataTransfer.files 后交给产品自己的 onAddFiles —— 于是这里合成一次 drop，
+     * 复用产品自己的校验与创建通路，不复制它的任何逻辑（与工具箱 element.click() 同理）。
+     *
+     * ⚠️ 这是取巧手法。将来 DSH 若给插件开放正规的附件接口，这里应当换掉。
+     */
+    function placeIntoComposer(dataUrl) {
+      const file = dataUrlToFile(dataUrl, DROP_FILE_NAME)
+      const dataTransfer = new DataTransfer()
+      dataTransfer.items.add(file)
+      document.dispatchEvent(new DragEvent('drop', {
+        dataTransfer: dataTransfer,
+        bubbles: true,
+        cancelable: true,
+      }))
+      return file
+    }
 
     function log() {
       try { console.log.apply(console, ['[screen-snap]'].concat(Array.prototype.slice.call(arguments))) } catch (_) {}
@@ -55,14 +101,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    async function recognize(dataUrl, prompt, sessionId) {
-      const result = await requestJson(RECOGNIZE_PATH, {
-        body: JSON.stringify({ dataUrl, prompt, sessionId }),
-      }, RECOGNIZE_TIMEOUT_MS)
-      if (!result.ok || !result.body.ok) throw new Error(result.body.error || ('HTTP ' + result.status))
-      return result.body
-    }
-
     // QQ 式截屏：Host 弹原生全屏窗口直接在屏幕上框选；返回 { ok, dataUrl?, cancelled? }
     // signal 允许浮层关闭时中止等待（Host 侧会见到底层 socket 断开并杀掉原生窗口）。
     async function selectRegion(signal) {
@@ -85,12 +123,17 @@ window.__ModuleLoader__.load({
         open: false,
         status: 'idle',
         previewUrl: '',
-        prompt: '',
         error: '',
         sessionId: undefined,
         elapsed: 0,
         busyHint: false,
         selectAbort: null,
+        // 输入栏里当前的附件数。触发按钮每次渲染都会写一遍进来（它在 session 作用域的槽里，
+        // 拿得到 useInput）；浮层靠它对比"放入前 / 放入后"，把静默失败变成明确报错。
+        attachCount: -1,
+        attachBefore: -1,
+        // "放入输入栏"的校验定时器句柄（关闭浮层时要清掉）
+        placeTimer: null,
       }
       const listeners = new Set()
       const notify = () => { for (const fn of Array.from(listeners)) fn() }
@@ -102,21 +145,31 @@ window.__ModuleLoader__.load({
         { name: 'conversation.input.left', id: 'screen-snap', order: 90, label: '截图识别' },
         (props) => {
           const sessionId = props && props.sessionId
+          // 这个槽是 session 作用域，标准 props 里带 useInput（输入机状态的 selector hook）。
+          // 只借它读附件数量，作为"到底放进 composer 没有"的判据；props 里没有就退化成不校验。
+          // 条件调用 hook 在这里是安全的：某个槽的 props 形状在它的生命周期里不会变。
+          const useInput = props && props.useInput
+          if (typeof useInput === 'function') {
+            const count = useInput((state) => (
+              state && state.attachmentIds ? state.attachmentIds.length : -1
+            ))
+            if (typeof count === 'number') store.attachCount = count
+          }
           return React.createElement('button', {
             className: 'scap-trigger',
             onClick: () => {
-              store.prompt = ''
               store.previewUrl = ''
               store.error = ''
               store.elapsed = 0
               store.busyHint = false
               store.sessionId = sessionId
+              store.attachBefore = -1
               store.open = true
               store.status = 'selecting'
-              log('trigger: sessionId=' + String(sessionId))
+              log('trigger: sessionId=' + String(sessionId) + ' attachments=' + store.attachCount)
               notify()
             },
-            title: '截取屏幕并识别（QQ 式框选）',
+            title: '截取屏幕并放入输入栏（QQ 式框选）',
           },
             React.createElement('svg', {
               width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', style: { display: 'block', flexShrink: 0 },
@@ -132,7 +185,7 @@ window.__ModuleLoader__.load({
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register(
         { name: 'shell.overlay', id: 'screen-snap-overlay', order: 90, label: '截图识别' },
-        () => React.createElement(CaptureView, { store, subscribe, recognize, selectRegion }),
+        () => React.createElement(CaptureView, { store, subscribe, placeIntoComposer, selectRegion }),
       ))
 
       // 注入玻璃拟态样式：直接用 DOM（与 frosted-glass 相同方式，避免 styles 服务不可用）
@@ -169,13 +222,12 @@ window.__ModuleLoader__.load({
       '.scap-prep{position:absolute;inset:0;display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;color:#fff;background:rgba(0,0,0,0.4);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);box-sizing:border-box;padding:12px;gap:10px}',
       '.scap-prep .row{display:flex;gap:8px;justify-content:center;align-items:center}',
       '.scap-prep .status{text-align:center;font-size:13px}',
-      '.scap-input{margin-top:12px;width:90%;max-width:1200px;padding:10px 13px;border-radius:12px;border:1px solid rgba(255,255,255,0.18);background:rgba(255,255,255,0.1);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);color:#fff;font-size:14px;outline:none;box-sizing:border-box}',
-      '.scap-input::placeholder{color:rgba(255,255,255,0.55)}',
       '.scap-msg.error{color:#ff8a8a}',
     ].join('')
 
+    // 配文字这件事本来就在 composer 的草稿框里做，浮层不再重复一个提示词输入框。
     function CaptureView(props) {
-      const { store, subscribe, recognize, selectRegion } = props
+      const { store, subscribe, placeIntoComposer, selectRegion } = props
       const [, force] = React.useState(0)
       React.useEffect(() => subscribe(() => force((n) => n + 1)), [])
 
@@ -286,6 +338,7 @@ window.__ModuleLoader__.load({
       if (!store.open) return null
 
       const close = () => {
+        if (store.placeTimer) { clearInterval(store.placeTimer); store.placeTimer = null }
         if (store.selectAbort) {
           try { store.selectAbort.abort() } catch (_) {}
           store.selectAbort = null
@@ -383,22 +436,53 @@ window.__ModuleLoader__.load({
         notify_()
       }
 
-      const confirmSend = async () => {
-        store.status = 'uploading'
+      // 放入输入栏：合成一次 drop 交给 composer 自己的附件通路，然后**校验它真的进去了**。
+      // 会话正忙时附件栏的 canAcceptDrop 为 false，那次 drop 会被静默忽略——不校验的话
+      // 浮层会假装成功然后关掉，用户对着空输入栏发愣。这正是本插件历史上最典型的那类 bug。
+      const place = () => {
+        const before = store.attachCount
+        store.attachBefore = before
+        store.status = 'placing'
+        store.error = ''
         notify_()
+        let file
         try {
-          await recognize(store.previewUrl, store.prompt, store.sessionId)
-          store.status = 'done'
-          store.error = ''
+          file = placeIntoComposer(store.previewUrl)
         } catch (e) {
           store.status = 'error'
-          store.error = '上传异常：' + String(e && e.message ? e.message : e)
+          store.error = '放入输入栏失败：' + String(e && e.message ? e.message : e)
+          notify_()
+          return
         }
-        notify_()
+        log('place:', file.name, Math.round(file.size / 1024) + 'KB', 'attachments before=' + before)
+        const startedAt = Date.now()
+        store.placeTimer = setInterval(() => {
+          // attachCount < 0 表示拿不到输入机状态（props 里没有 useInput），此时无法校验，
+          // 按成功处理——不能因为"校验不了"就把能用的功能卡死。
+          const verified = store.attachCount < 0 || (before >= 0 && store.attachCount > before)
+          if (verified) {
+            clearInterval(store.placeTimer)
+            store.placeTimer = null
+            log('place: ok, attachments=' + store.attachCount)
+            store.open = false
+            store.status = 'idle'
+            store.previewUrl = ''
+            notify_()
+            return
+          }
+          if (Date.now() - startedAt > PLACE_VERIFY_MS) {
+            clearInterval(store.placeTimer)
+            store.placeTimer = null
+            store.status = 'error'
+            store.error = '没能放进输入栏：会话可能正忙（附件栏此刻不接受新附件）。'
+              + '等上一条发完再试，或改用「浏览器共享」。'
+            notify_()
+          }
+        }, 100)
       }
 
       const startSelect = () => {
-        if (store.status === 'selecting' || store.status === 'capturing' || store.status === 'uploading') return
+        if (store.status === 'selecting' || store.status === 'capturing' || store.status === 'placing') return
         store.status = 'selecting'
         store.previewUrl = ''
         store.error = ''
@@ -410,20 +494,14 @@ window.__ModuleLoader__.load({
         notify_()
       }
 
-      const promptChange = (e) => {
-        store.prompt = e.target.value
-        notify_()
-      }
-
       const dragging = store.status === 'capturing'
       const selW = Math.abs(sel.ex - sel.sx)
       const selH = Math.abs(sel.ey - sel.sy)
       const selX = Math.min(sel.sx, sel.ex)
       const selY = Math.min(sel.sy, sel.ey)
-      const busy = store.status === 'selecting' || store.status === 'capturing' || store.status === 'uploading'
-      const showPrompt = store.status === 'confirm'
+      const busy = store.status === 'selecting' || store.status === 'capturing' || store.status === 'placing'
       const stageCls = 'scap-stage' + (dragging ? ' capturing' : '')
-      const inResult = store.status === 'confirm' || store.status === 'uploading' || store.status === 'done' || store.status === 'error'
+      const inResult = store.status === 'confirm' || store.status === 'placing' || store.status === 'error'
       const startLabel = store.status === 'selecting' ? '等待框选…'
         : store.status === 'capturing' ? '正在共享…'
           : '重新截屏'
@@ -436,8 +514,8 @@ window.__ModuleLoader__.load({
                 + (store.busyHint ? '（若桌面没有出现冻结画面，可直接点「取消」退出）' : ''))
               : store.status === 'error' ? (store.error || '出错了')
                 : store.status === 'capturing' ? (store.error || '已共享：请拖拽框选识别区域')
-                  : store.status === 'confirm' ? '已框选：预览确认后发送'
-                    : store.status === 'uploading' ? '上传识别中…' : ''),
+                  : store.status === 'confirm' ? '已框选：确认后放进输入栏，你自己配文字再发'
+                    : store.status === 'placing' ? '正在放进输入栏…' : ''),
           React.createElement('button', { className: 'scap-btn', onClick: startSelect, disabled: busy }, startLabel),
           React.createElement('button', { className: 'scap-btn', onClick: close }, '取消'),
         ),
@@ -483,21 +561,17 @@ window.__ModuleLoader__.load({
                 : null,
               store.status === 'confirm'
                 ? React.createElement('div', { className: 'row' },
-                  React.createElement('button', { className: 'scap-btn primary', onClick: confirmSend }, '✅ 确认发送'),
+                  React.createElement('button', { className: 'scap-btn primary', onClick: place }, '📎 放入输入栏'),
                   React.createElement('button', { className: 'scap-btn', onClick: startSelect }, '↺ 重新框选'),
                 )
                 : null,
-              store.status === 'uploading' ? React.createElement('div', { className: 'status' }, '上传并识别中…') : null,
-              store.status === 'done' ? React.createElement('div', { className: 'status' }, '已把截图发送进会话，模型将开始识别（可继续追问）。') : null,
+              store.status === 'placing' ? React.createElement('div', { className: 'status' }, '正在放进输入栏…') : null,
               store.status === 'error' ? React.createElement('div', { className: 'status' }, React.createElement('span', { className: 'scap-msg error' }, store.error)) : null,
-              store.status === 'done' || store.status === 'error'
+              store.status === 'error'
                 ? React.createElement('div', { className: 'row' },
-                  store.status === 'error'
-                    ? React.createElement('button', { className: 'scap-btn primary', onClick: startSelect }, '↺ 重试本机框选')
-                    : null,
-                  store.status === 'error'
-                    ? React.createElement('button', { className: 'scap-btn', onClick: () => startCapture('') }, '改用浏览器共享')
-                    : null,
+                  React.createElement('button', { className: 'scap-btn primary', onClick: place }, '📎 重试放入'),
+                  React.createElement('button', { className: 'scap-btn', onClick: startSelect }, '↺ 重新框选'),
+                  React.createElement('button', { className: 'scap-btn', onClick: () => startCapture('') }, '改用浏览器共享'),
                   React.createElement('button', { className: 'scap-btn', onClick: close }, '关闭'),
                 )
                 : null,
@@ -518,14 +592,6 @@ window.__ModuleLoader__.load({
             : null,
         ),
 
-        showPrompt
-          ? React.createElement('input', {
-            className: 'scap-input',
-            value: store.prompt,
-            onChange: promptChange,
-            placeholder: '可选：想让模型识别什么（默认识别截图内容）',
-          })
-          : null,
       )
     }
 
